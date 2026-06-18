@@ -1,12 +1,12 @@
-/* cgi.c - read a CGI request from the environment and stdin (C99) */
+/* cgi.c - parse a request from a transport (io_t) into a cgi_request_t (C99) */
 #include "cgi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *getenv_or(const char *name, const char *dflt) {
-    const char *v = getenv(name);
+static const char *io_env_or(io_t *io, const char *name, const char *dflt) {
+    const char *v = io->env(io, name);
     return v ? v : dflt;
 }
 
@@ -105,31 +105,36 @@ static void parse_cookies(map_t *m, const char *s) {
     }
 }
 
-int cgi_read(cgi_request_t *r) {
+int cgi_read(cgi_request_t *r, io_t *io) {
     const char *clen_s;
 
-    r->method    = getenv_or("REQUEST_METHOD", "GET");
-    r->path_info = getenv_or("PATH_INFO", "");
+    r->method    = io_env_or(io, "REQUEST_METHOD", "GET");
+    r->path_info = io_env_or(io, "PATH_INFO", "");
     map_init(&r->params);
     map_init(&r->cookies);
     sb_init(&r->body);
 
-    parse_urlencoded(&r->params, getenv("QUERY_STRING"));
-    parse_cookies(&r->cookies, getenv("HTTP_COOKIE"));
+    parse_urlencoded(&r->params, io->env(io, "QUERY_STRING"));
+    parse_cookies(&r->cookies, io->env(io, "HTTP_COOKIE"));
 
     /* Read request body (POST/PUT) up to CONTENT_LENGTH. */
-    clen_s = getenv("CONTENT_LENGTH");
+    clen_s = io->env(io, "CONTENT_LENGTH");
     if (clen_s) {
-        long  clen = strtol(clen_s, NULL, 10);
-        long  got  = 0;
-        int   ch;
-        while (got < clen && (ch = getchar()) != EOF) {
-            sb_putc(&r->body, (char)ch);
-            got++;
+        long   clen = strtol(clen_s, NULL, 10);
+        long   got  = 0;
+        char   buf[4096];
+        while (got < clen) {
+            size_t want = (size_t)(clen - got);
+            size_t n;
+            if (want > sizeof buf) want = sizeof buf;
+            n = io->read(io, buf, want);
+            if (n == 0) break;          /* EOF before CONTENT_LENGTH */
+            sb_write(&r->body, buf, n);
+            got += (long)n;
         }
         /* If form-encoded, fold body params into the param map too. */
         {
-            const char *ct = getenv("CONTENT_TYPE");
+            const char *ct = io->env(io, "CONTENT_TYPE");
             if (ct && strstr(ct, "application/x-www-form-urlencoded"))
                 parse_urlencoded(&r->params, r->body.data);
         }

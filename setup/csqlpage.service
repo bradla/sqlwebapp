@@ -1,0 +1,23 @@
+# /etc/systemd/system/csqlpage.service
+# Resident FastCGI process for csqlpage. Apache (mod_proxy_fcgi) proxies to it.
+#   sudo systemctl daemon-reload && sudo systemctl enable --now csqlpage
+[Unit]
+Description=csqlpage FastCGI responder
+After=network.target postgresql.service
+
+[Service]
+User=http
+Group=http
+# Listen address Apache will proxy to (TCP here; a unix socket also works).
+Environment=SQLPAGE_FCGI_BIND=127.0.0.1:9000
+# URL sub-path the app is mounted under (matches the Apache ProxyPass below).
+Environment=SQLPAGE_SITE_PREFIX=/app
+# Where the .sql pages live.
+Environment=SQLPAGE_WEB_ROOT=/srv/http/sqlpages
+# PostgreSQL connection (kept alive and reused across requests).
+Environment=SQLPAGE_DATABASE_URL=postgresql://blog:blog1234@localhost/mydb
+ExecStart=/srv/http/cgi-bin/csqlpage
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

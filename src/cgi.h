@@ -2,6 +2,7 @@
 #ifndef CSQLPAGE_CGI_H
 #define CSQLPAGE_CGI_H
 
+#include "io.h"
 #include "map.h"
 #include "util.h"
 
@@ -13,8 +14,9 @@ typedef struct {
     sb_t        body;        /* raw request body bytes                    */
 } cgi_request_t;
 
-/* Populate `r` from the CGI environment and stdin. Returns 0 on success. */
-int  cgi_read(cgi_request_t *r);
+/* Populate `r` from the request transport `io`. Returns 0 on success.
+   `r` borrows env strings from `io`, which must outlive `r`. */
+int  cgi_read(cgi_request_t *r, io_t *io);
 void cgi_free(cgi_request_t *r);
 
 /* URL-decode `src` (application/x-www-form-urlencoded) into a fresh string.

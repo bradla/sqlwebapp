@@ -28,6 +28,11 @@ struct render_state {
     int    head_flushed;    /* have we committed to the body phase?        */
     char  *current;         /* active body component name (owned), or NULL */
     long   comp_rows;       /* data rows emitted into current component     */
+
+    int    debug;           /* append a debug footer?                      */
+    double total_ms;        /* whole-request wall time                     */
+    double db_ms;           /* time spent in the data/SQL request          */
+    long   rss_kb;          /* peak resident memory (KB), or -1            */
 };
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -62,7 +67,34 @@ render_t *render_new(void) {
     r->head_flushed  = 0;
     r->current       = NULL;
     r->comp_rows     = 0;
+    r->debug         = 0;
+    r->total_ms      = 0;
+    r->db_ms         = 0;
+    r->rss_kb        = -1;
     return r;
+}
+
+void render_set_debug(render_t *r, double total_ms, double db_ms, long rss_kb) {
+    r->debug    = 1;
+    r->total_ms = total_ms;
+    r->db_ms    = db_ms;
+    r->rss_kb   = rss_kb;
+}
+
+/* Append a fixed debug bar reporting timing and memory. */
+static void append_debug_bar(render_t *r) {
+    size_t bytes = r->body.len;   /* response size so far, before the bar */
+    sb_puts(&r->body,
+        "<div style=\"position:fixed;bottom:0;left:0;right:0;z-index:9999;"
+        "background:#222;color:#9f9;font:12px/1.4 monospace;"
+        "padding:.4rem .8rem;border-top:2px solid #9f9\">");
+    sb_printf(&r->body,
+        "csqlpage debug &middot; total %.2f ms &middot; data/SQL %.2f ms "
+        "&middot; response %lu B",
+        r->total_ms, r->db_ms, (unsigned long)bytes);
+    if (r->rss_kb >= 0)
+        sb_printf(&r->body, " &middot; peak RSS %ld KB", r->rss_kb);
+    sb_puts(&r->body, "</div>\n");
 }
 
 /* Open the shell <head> + opening <body> markup into r->body. */
@@ -273,46 +305,59 @@ static void component_close(render_t *r) {
 
 /* ---- finalization ------------------------------------------------------ */
 
-static void emit_headers(render_t *r) {
-    printf("Status: %d\r\n", r->status);
-    if (r->redirect) printf("Location: %s\r\n", r->redirect);
-    if (r->headers.len) fwrite(r->headers.data, 1, r->headers.len, stdout);
-    printf("Content-Type: text/html; charset=utf-8\r\n");
-    printf("\r\n");
+static void emit_headers(render_t *r, sb_t *out) {
+    sb_printf(out, "Status: %d\r\n", r->status);
+    if (r->redirect) sb_printf(out, "Location: %s\r\n", r->redirect);
+    if (r->headers.len) sb_write(out, r->headers.data, r->headers.len);
+    sb_puts(out, "Content-Type: text/html; charset=utf-8\r\n");
+    sb_puts(out, "\r\n");
 }
 
-void render_finish(render_t *r) {
+static void render_done(render_t *r) {
+    sb_free(&r->body);
+    sb_free(&r->headers);
+    free(r->redirect);
+    free(r->title);
+    free(r->current);
+    free(r);
+}
+
+void render_finish(render_t *r, io_t *io) {
+    sb_t out;
     flush_head(r);          /* ensure a head even for empty output */
     component_close(r);
+    if (r->debug && !r->redirect)
+        append_debug_bar(r);
     if (r->shell_enabled && !r->redirect)
         sb_puts(&r->body, "</body>\n</html>\n");
 
-    emit_headers(r);
-    if (!r->redirect) fwrite(r->body.data, 1, r->body.len, stdout);
+    sb_init(&out);
+    emit_headers(r, &out);
+    if (!r->redirect) sb_write(&out, r->body.data, r->body.len);
+    io->write(io, out.data, out.len);
+    sb_free(&out);
 
-    sb_free(&r->body);
-    sb_free(&r->headers);
-    free(r->redirect);
-    free(r->title);
-    free(r->current);
-    free(r);
+    render_done(r);
 }
 
-void render_error(render_t *r, const char *message) {
-    /* The body is buffered until now, so nothing has reached stdout yet:
-       always emit a clean 500 with proper CGI headers. */
-    printf("Status: 500\r\nContent-Type: text/html; charset=utf-8\r\n\r\n");
-    printf("<!DOCTYPE html><html><head><title>Error</title></head><body>\n");
-    printf("<pre style=\"color:#b00;white-space:pre-wrap\">");
-    /* escape into a temp buffer */
-    { sb_t e; sb_init(&e); sb_put_html(&e, message);
-      fwrite(e.data, 1, e.len, stdout); sb_free(&e); }
-    printf("</pre>\n</body></html>\n");
+void render_error(render_t *r, io_t *io, const char *message) {
+    /* Nothing has been written to the transport yet (output is buffered),
+       so always emit a clean 500 with proper CGI headers. */
+    sb_t out;
+    sb_init(&out);
+    sb_puts(&out, "Status: 500\r\nContent-Type: text/html; charset=utf-8\r\n\r\n");
+    sb_puts(&out, "<!DOCTYPE html><html><head><title>Error</title></head><body>\n");
+    sb_puts(&out, "<pre style=\"color:#b00;white-space:pre-wrap\">");
+    sb_put_html(&out, message);
+    sb_puts(&out, "</pre>\n");
+    if (r->debug)
+        sb_printf(&out, "<p style=\"font:12px monospace;color:#666\">"
+                  "debug &middot; total %.2f ms &middot; data/SQL %.2f ms"
+                  " &middot; peak RSS %ld KB</p>\n",
+                  r->total_ms, r->db_ms, r->rss_kb);
+    sb_puts(&out, "</body></html>\n");
+    io->write(io, out.data, out.len);
+    sb_free(&out);
 
-    sb_free(&r->body);
-    sb_free(&r->headers);
-    free(r->redirect);
-    free(r->title);
-    free(r->current);
-    free(r);
+    render_done(r);
 }

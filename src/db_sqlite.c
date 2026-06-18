@@ -1,9 +1,8 @@
-/* db.c - run a SQLPage-style SQL script against SQLite (C99) */
-#include "db.h"
+/* db_sqlite.c - run a SQLPage-style SQL script against SQLite (C99) */
+#include "db_backends.h"
 #include "util.h"
 
 #include <sqlite3.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,18 +49,18 @@ static void emit_row(sqlite3_stmt *stmt, row_cb cb, void *user) {
     free(row.cells);
 }
 
-int db_run_script(const char        *db_path,
-                  const char        *sql,
-                  const cgi_request_t *req,
-                  row_cb             cb,
-                  void              *user,
-                  char             **errmsg) {
+int sqlite_run_script(const char        *path,
+                      const char        *sql,
+                      const cgi_request_t *req,
+                      row_cb             cb,
+                      void              *user,
+                      char             **errmsg) {
     sqlite3     *db   = NULL;
     const char  *tail = sql;
     int          rc;
 
     *errmsg = NULL;
-    rc = sqlite3_open(db_path, &db);
+    rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
         *errmsg = xstrdup(sqlite3_errmsg(db));
         sqlite3_close(db);
