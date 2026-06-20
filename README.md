@@ -91,7 +91,12 @@ Alias /assets /srv/http/assets
 <Directory "/srv/http/assets">
     Require all granted
 </Directory>
+```
+The asset URL prefix defaults to `/assets`; override with `SQLPAGE_ASSETS_BASE`
+(e.g. a CDN base, or a different mount). nginx serves it with a plain
+`location /assets/ { root /srv/http; }`.
 
+```apache
 <VirtualHost *:80>
     ServerName app.example.com
 
@@ -129,6 +134,3 @@ Alias /assets /srv/http/assets
 </VirtualHost>
 
 ```
-The asset URL prefix defaults to `/assets`; override with `SQLPAGE_ASSETS_BASE`
-(e.g. a CDN base, or a different mount). nginx serves it with a plain
-`location /assets/ { root /srv/http; }`.
