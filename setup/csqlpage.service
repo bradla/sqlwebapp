@@ -12,6 +12,8 @@ Group=http
 Environment=SQLPAGE_FCGI_BIND=127.0.0.1:9000
 # URL sub-path the app is mounted under (matches the Apache ProxyPass below).
 Environment=SQLPAGE_SITE_PREFIX=/app
+# add debug info at the botom of the page
+Environment=SQLPAGE_DEBUG=1
 # Where the .sql pages live.
 Environment=SQLPAGE_WEB_ROOT=/srv/http/sqlpages
 # PostgreSQL connection (kept alive and reused across requests).
