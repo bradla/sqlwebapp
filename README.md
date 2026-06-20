@@ -91,6 +91,43 @@ Alias /assets /srv/http/assets
 <Directory "/srv/http/assets">
     Require all granted
 </Directory>
+
+<VirtualHost *:80>
+    ServerName app.example.com
+
+    ProxyPass        "/app/" "fcgi://127.0.0.1:9000/"
+    ProxyPassReverse "/app/" "fcgi://127.0.0.1:9000/"
+    Alias /assets /srv/http/assets
+    <Directory "/srv/http/assets">
+        Require all granted
+    </Directory>
+
+    # Pass these into every CGI invocation.
+    SetEnv SQLPAGE_WEB_ROOT     /srv/http/sqlpages
+    #SetEnv SQLPAGE_DATABASE_URL sqlite:///srv/http/csqlpage/app.db
+    SetEnv SQLPAGE_DATABASE_URL postgresql://username:password@localhost/mydb
+
+    # Map the URL prefix /app to the csqlpage binary.
+    # A request to /app/users.sql  ->  PATH_INFO=/users.sql
+    # A request to /app  or  /app/ ->  PATH_INFO empty -> index.sql
+    # Enable for just cgi
+    #ScriptAlias /app /srv/http/cgi-bin/csqlpage
+
+    #<Directory "/srv/http/cgi-bin">
+    #   # AllowOverride None
+    #    Options +ExecCGI
+    #    #AddHandler cgi-script .py
+    #    Require all granted
+    #</Directory>
+
+    # Optional: make the app the site root instead of living under /app.
+    # ScriptAlias / /var/www/cgi-bin/csqlpage/
+    # (note the trailing slash on both sides for the root form)
+
+    ErrorLog  /var/log/httpd/csqlpage_error.log
+    CustomLog /var/log/httpd/csqlpage_access.log combined
+</VirtualHost>
+
 ```
 The asset URL prefix defaults to `/assets`; override with `SQLPAGE_ASSETS_BASE`
 (e.g. a CDN base, or a different mount). nginx serves it with a plain
