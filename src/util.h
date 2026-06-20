@@ -13,6 +13,7 @@ typedef struct {
 
 void  sb_init(sb_t *b);
 void  sb_free(sb_t *b);
+void  sb_clear(sb_t *b);                          /* reset length to 0, keep capacity */
 void  sb_putc(sb_t *b, char c);
 void  sb_write(sb_t *b, const char *s, size_t n);
 void  sb_puts(sb_t *b, const char *s);            /* NUL-terminated */

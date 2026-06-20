@@ -38,6 +38,11 @@ void sb_free(sb_t *b) {
     b->len = b->cap = 0;
 }
 
+void sb_clear(sb_t *b) {
+    b->len = 0;
+    b->data[0] = '\0';
+}
+
 static void sb_reserve(sb_t *b, size_t extra) {
     if (b->len + extra + 1 > b->cap) {
         while (b->len + extra + 1 > b->cap) b->cap *= 2;

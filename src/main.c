@@ -81,7 +81,7 @@ static void handle_request(io_t *io) {
 
     cgi_read(&req, io);
     dbg = debug_enabled(io);
-    r = render_new();
+    r = render_new(io_env_or(io, "SQLPAGE_ASSETS_BASE", "/assets"));
 
     /* Route on PATH_INFO; fall back to SCRIPT_NAME for transports that put the
        request path there instead (notably Apache mod_proxy_fcgi). Then strip

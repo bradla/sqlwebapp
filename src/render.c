@@ -33,6 +33,28 @@ struct render_state {
     double total_ms;        /* whole-request wall time                     */
     double db_ms;           /* time spent in the data/SQL request          */
     long   rss_kb;          /* peak resident memory (KB), or -1            */
+
+    char  *assets_base;     /* URL prefix for Tabler/ApexCharts (owned)    */
+
+    /* chart component accumulation */
+    int    chart_seq;       /* unique id counter for chart <div>s          */
+    char  *chart_type;      /* line | bar | area | pie | donut (owned)     */
+    sb_t   chart_x;         /* JSON-encoded x labels, comma-separated      */
+    sb_t   chart_y;         /* JSON-encoded y values, comma-separated      */
+
+    /* interactive ("spreadsheet") table state */
+    int    el_seq;          /* unique id counter for interactive elements  */
+    int    table_id;        /* id of the active table if interactive, else 0 */
+    int    table_search;    /* show a search box?                          */
+    int    table_sort;      /* allow column sorting?                       */
+    int    table_per_page;  /* rows per page                               */
+
+    /* map component state */
+    int    map_id;          /* id of the active map's <div>                */
+    char  *map_lat;         /* center latitude prop (owned), or NULL       */
+    char  *map_lon;         /* center longitude prop (owned), or NULL      */
+    char  *map_zoom;        /* zoom prop (owned), or NULL                  */
+    sb_t   map_markers;     /* JSON [[lat,lon,popup],...] without brackets  */
 };
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -50,13 +72,49 @@ static int is_header_component(const char *c) {
 /* Append a value, HTML-escaped; if NULL, append nothing. */
 static void put_esc(sb_t *b, const char *v) { if (v) sb_put_html(b, v); }
 
+/* ---- JSON helpers (for the chart component's data) --------------------- */
+
+static void json_quote(sb_t *b, const char *s) {
+    sb_putc(b, '"');
+    if (s) for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+            case '"':  sb_puts(b, "\\\""); break;
+            case '\\': sb_puts(b, "\\\\"); break;
+            case '\n': sb_puts(b, "\\n");  break;
+            case '\r': sb_puts(b, "\\r");  break;
+            case '\t': sb_puts(b, "\\t");  break;
+            default:
+                if (c < 0x20) sb_printf(b, "\\u%04x", c);
+                else          sb_putc(b, (char)c);
+        }
+    }
+    sb_putc(b, '"');
+}
+
+/* True when `s` is parseable as a JSON-safe number (emit unquoted). */
+static int is_number(const char *s) {
+    char *end;
+    if (!s || !*s) return 0;
+    strtod(s, &end);
+    return *end == '\0';
+}
+
+/* Append a JSON value: bare number when numeric, quoted string otherwise,
+   `null` when absent. */
+static void json_value(sb_t *b, const char *s) {
+    if (!s)              sb_puts(b, "null");
+    else if (is_number(s)) sb_puts(b, s);
+    else                 json_quote(b, s);
+}
+
 /* ---- component lifecycle ----------------------------------------------- */
 
 static void component_open(render_t *r, const row_t *props);
 static void component_close(render_t *r);
 static void component_data_row(render_t *r, const row_t *row);
 
-render_t *render_new(void) {
+render_t *render_new(const char *assets_base) {
     render_t *r = xmalloc(sizeof(*r));
     sb_init(&r->body);
     sb_init(&r->headers);
@@ -71,7 +129,28 @@ render_t *render_new(void) {
     r->total_ms      = 0;
     r->db_ms         = 0;
     r->rss_kb        = -1;
+    r->assets_base   = xstrdup(assets_base ? assets_base : "/assets");
+    r->chart_seq     = 0;
+    r->chart_type    = NULL;
+    sb_init(&r->chart_x);
+    sb_init(&r->chart_y);
+    r->el_seq         = 0;
+    r->table_id       = 0;
+    r->table_search   = 0;
+    r->table_sort     = 0;
+    r->table_per_page = 10;
+    r->map_id         = 0;
+    r->map_lat        = NULL;
+    r->map_lon        = NULL;
+    r->map_zoom       = NULL;
+    sb_init(&r->map_markers);
     return r;
+}
+
+/* Treat a prop as true unless it is absent or an explicit falsey token. */
+static int truthy(const char *v) {
+    return v && *v && strcmp(v, "0") != 0 &&
+           strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 && strcmp(v, "no") != 0;
 }
 
 void render_set_debug(render_t *r, double total_ms, double db_ms, long rss_kb) {
@@ -97,28 +176,27 @@ static void append_debug_bar(render_t *r) {
     sb_puts(&r->body, "</div>\n");
 }
 
-/* Open the shell <head> + opening <body> markup into r->body. */
+/* Open the shell <head> + opening <body> markup into r->body.
+   Tabler provides the styling; ApexCharts powers the chart component. Both are
+   loaded from SQLPAGE_ASSETS_BASE, which the front-end web server serves. */
 static void shell_open(render_t *r) {
+    const char *base = r->assets_base;
     sb_puts(&r->body, "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
     sb_puts(&r->body, "<meta charset=\"utf-8\">\n");
     sb_puts(&r->body, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
     sb_puts(&r->body, "<title>");
     put_esc(&r->body, r->title ? r->title : "SQLPage");
     sb_puts(&r->body, "</title>\n");
-    /* Minimal built-in stylesheet; real SQLPage ships Tabler. */
-    sb_puts(&r->body,
-        "<style>"
-        "body{font-family:system-ui,sans-serif;margin:2rem;max-width:60rem;color:#222}"
-        "table{border-collapse:collapse;width:100%}"
-        "th,td{border:1px solid #ddd;padding:.4rem .6rem;text-align:left}"
-        "th{background:#f6f6f6}"
-        ".card{border:1px solid #ddd;border-radius:.5rem;padding:1rem;margin:.5rem 0}"
-        ".cards{display:flex;gap:1rem;flex-wrap:wrap}"
-        "label{display:block;margin:.5rem 0 .2rem;font-weight:600}"
-        "input,textarea,select{width:100%;padding:.4rem;box-sizing:border-box}"
-        "button{margin-top:1rem;padding:.5rem 1rem}"
-        "</style>\n");
+    sb_printf(&r->body, "<link rel=\"stylesheet\" href=\"%s/tabler.min.css\">\n", base);
+    sb_printf(&r->body, "<link rel=\"stylesheet\" href=\"%s/simple-datatables.css\">\n", base);
+    sb_printf(&r->body, "<link rel=\"stylesheet\" href=\"%s/leaflet.css\">\n", base);
+    sb_printf(&r->body, "<script src=\"%s/apexcharts.min.js\"></script>\n", base);
+    sb_printf(&r->body, "<script src=\"%s/simple-datatables.js\"></script>\n", base);
+    sb_printf(&r->body, "<script src=\"%s/leaflet.js\"></script>\n", base);
     sb_puts(&r->body, "</head>\n<body>\n");
+    sb_puts(&r->body,
+        "<div class=\"page\"><div class=\"page-wrapper\"><div class=\"page-body\">\n"
+        "<div class=\"container-xl\">\n");
 }
 
 /* Commit to the body phase: emit shell head exactly once. */
@@ -188,32 +266,76 @@ void render_row(const row_t *row, void *user) {
 
 /* ---- the components ---------------------------------------------------- */
 
+static void card_header(render_t *r, const char *title) {
+    if (!title) return;
+    sb_puts(&r->body, "<div class=\"card-header\"><h3 class=\"card-title\">");
+    put_esc(&r->body, title);
+    sb_puts(&r->body, "</h3></div>\n");
+}
+
 static void component_open(render_t *r, const row_t *props) {
-    const char *c = r->current;
+    const char *c     = r->current;
+    const char *title = row_get(props, "title");
+
     if (strcmp(c, "text") == 0) {
-        const char *title = row_get(props, "title");
-        if (title) { sb_puts(&r->body, "<h2>"); put_esc(&r->body, title); sb_puts(&r->body, "</h2>\n"); }
-        /* `contents` prop renders immediately as a paragraph. */
+        if (title) { sb_puts(&r->body, "<h2 class=\"mb-2\">"); put_esc(&r->body, title); sb_puts(&r->body, "</h2>\n"); }
         { const char *contents = row_get(props, "contents");
           if (contents) { sb_puts(&r->body, "<p>"); put_esc(&r->body, contents); sb_puts(&r->body, "</p>\n"); } }
+
+    } else if (strcmp(c, "table") == 0) {
+        const char *pp = row_get(props, "per_page");
+        r->table_search   = truthy(row_get(props, "search"));
+        r->table_sort     = truthy(row_get(props, "sort"));
+        r->table_per_page = pp ? atoi(pp) : 10;
+        if (r->table_per_page <= 0) r->table_per_page = 10;
+        /* interactive ("spreadsheet") only when sort/search requested */
+        r->table_id = (r->table_search || r->table_sort) ? ++r->el_seq : 0;
+        sb_puts(&r->body, "<div class=\"card mb-3\">\n");
+        card_header(r, title);
+        /* the <table> opens lazily on the first data row (needs columns) */
+
     } else if (strcmp(c, "list") == 0) {
-        const char *title = row_get(props, "title");
-        if (title) { sb_puts(&r->body, "<h2>"); put_esc(&r->body, title); sb_puts(&r->body, "</h2>\n"); }
-        sb_puts(&r->body, "<ul>\n");
+        sb_puts(&r->body, "<div class=\"card mb-3\">\n");
+        card_header(r, title);
+        sb_puts(&r->body, "<div class=\"list-group list-group-flush\">\n");
+
     } else if (strcmp(c, "card") == 0) {
-        const char *title = row_get(props, "title");
-        if (title) { sb_puts(&r->body, "<h2>"); put_esc(&r->body, title); sb_puts(&r->body, "</h2>\n"); }
-        sb_puts(&r->body, "<div class=\"cards\">\n");
+        if (title) { sb_puts(&r->body, "<h2 class=\"mb-2\">"); put_esc(&r->body, title); sb_puts(&r->body, "</h2>\n"); }
+        sb_puts(&r->body, "<div class=\"row row-cards mb-3\">\n");
+
     } else if (strcmp(c, "form") == 0) {
         const char *action = row_get(props, "action");
         const char *method = row_get(props, "method");
-        sb_puts(&r->body, "<form method=\"");
+        sb_puts(&r->body, "<form class=\"card mb-3\" method=\"");
         put_esc(&r->body, method ? method : "post");
         sb_puts(&r->body, "\"");
         if (action) { sb_puts(&r->body, " action=\""); put_esc(&r->body, action); sb_puts(&r->body, "\""); }
-        sb_puts(&r->body, ">\n");
+        sb_puts(&r->body, ">\n<div class=\"card-body\">\n");
+        if (title) { sb_puts(&r->body, "<h3 class=\"card-title mb-3\">"); put_esc(&r->body, title); sb_puts(&r->body, "</h3>\n"); }
+
+    } else if (strcmp(c, "chart") == 0) {
+        const char *type = row_get(props, "type");
+        free(r->chart_type);
+        r->chart_type = xstrdup(type ? type : "line");
+        sb_clear(&r->chart_x);
+        sb_clear(&r->chart_y);
+        r->chart_seq++;
+        sb_puts(&r->body, "<div class=\"card mb-3\">\n");
+        card_header(r, title);
+        sb_printf(&r->body, "<div class=\"card-body\"><div id=\"chart%d\"></div></div>\n", r->chart_seq);
+
+    } else if (strcmp(c, "map") == 0) {
+        free(r->map_lat);  r->map_lat  = dup_or_null(row_get(props, "latitude"));
+        free(r->map_lon);  r->map_lon  = dup_or_null(row_get(props, "longitude"));
+        free(r->map_zoom); r->map_zoom = dup_or_null(row_get(props, "zoom"));
+        sb_clear(&r->map_markers);
+        r->map_id = ++r->el_seq;
+        sb_puts(&r->body, "<div class=\"card mb-3\">\n");
+        card_header(r, title);
+        sb_printf(&r->body,
+            "<div class=\"card-body\"><div id=\"map%d\" style=\"height:400px\"></div></div>\n",
+            r->map_id);
     }
-    /* `table` opens lazily on its first data row (it needs column names). */
 }
 
 static void component_data_row(render_t *r, const row_t *row) {
@@ -222,7 +344,10 @@ static void component_data_row(render_t *r, const row_t *row) {
     if (strcmp(c, "table") == 0) {
         size_t i;
         if (r->comp_rows == 0) {            /* first row: build header */
-            sb_puts(&r->body, "<table>\n<thead>\n<tr>");
+            sb_puts(&r->body, "<div class=\"table-responsive\">"
+                              "<table class=\"table table-vcenter card-table\"");
+            if (r->table_id) sb_printf(&r->body, " id=\"table%d\"", r->table_id);
+            sb_puts(&r->body, ">\n<thead>\n<tr>");
             for (i = 0; i < row->len; i++) {
                 if (strcmp(row->cells[i].name, "component") == 0) continue;
                 sb_puts(&r->body, "<th>");
@@ -244,62 +369,129 @@ static void component_data_row(render_t *r, const row_t *row) {
         const char *title = row_get(row, "title");
         const char *desc  = row_get(row, "description");
         const char *link  = row_get(row, "link");
-        sb_puts(&r->body, "<li>");
-        if (link) { sb_puts(&r->body, "<a href=\""); put_esc(&r->body, link); sb_puts(&r->body, "\">"); }
-        put_esc(&r->body, title ? title : "");
-        if (link) sb_puts(&r->body, "</a>");
-        if (desc) { sb_puts(&r->body, " &mdash; "); put_esc(&r->body, desc); }
-        sb_puts(&r->body, "</li>\n");
+        if (link) { sb_puts(&r->body, "<a class=\"list-group-item list-group-item-action\" href=\"");
+                    put_esc(&r->body, link); sb_puts(&r->body, "\">"); }
+        else      { sb_puts(&r->body, "<div class=\"list-group-item\">"); }
+        sb_puts(&r->body, "<div class=\"fw-bold\">"); put_esc(&r->body, title ? title : ""); sb_puts(&r->body, "</div>");
+        if (desc) { sb_puts(&r->body, "<div class=\"text-secondary\">"); put_esc(&r->body, desc); sb_puts(&r->body, "</div>"); }
+        sb_puts(&r->body, link ? "</a>\n" : "</div>\n");
 
     } else if (strcmp(c, "card") == 0) {
         const char *title = row_get(row, "title");
         const char *desc  = row_get(row, "description");
         const char *link  = row_get(row, "link");
-        sb_puts(&r->body, "<div class=\"card\">");
-        if (title) { sb_puts(&r->body, "<h3>"); put_esc(&r->body, title); sb_puts(&r->body, "</h3>"); }
-        if (desc)  { sb_puts(&r->body, "<p>");  put_esc(&r->body, desc);  sb_puts(&r->body, "</p>"); }
-        if (link)  { sb_puts(&r->body, "<a href=\""); put_esc(&r->body, link);
+        sb_puts(&r->body, "<div class=\"col-sm-6 col-lg-4\"><div class=\"card card-sm\"><div class=\"card-body\">");
+        if (title) { sb_puts(&r->body, "<h3 class=\"card-title\">"); put_esc(&r->body, title); sb_puts(&r->body, "</h3>"); }
+        if (desc)  { sb_puts(&r->body, "<p class=\"text-secondary\">"); put_esc(&r->body, desc); sb_puts(&r->body, "</p>"); }
+        if (link)  { sb_puts(&r->body, "<a class=\"btn btn-primary\" href=\""); put_esc(&r->body, link);
                      sb_puts(&r->body, "\">More</a>"); }
-        sb_puts(&r->body, "</div>\n");
+        sb_puts(&r->body, "</div></div></div>\n");
 
     } else if (strcmp(c, "form") == 0) {
         const char *name  = row_get(row, "name");
         const char *label = row_get(row, "label");
         const char *type  = row_get(row, "type");
         const char *value = row_get(row, "value");
-        sb_puts(&r->body, "<label>");
+        sb_puts(&r->body, "<div class=\"mb-3\"><label class=\"form-label\">");
         put_esc(&r->body, label ? label : (name ? name : ""));
-        sb_puts(&r->body, "</label>\n");
+        sb_puts(&r->body, "</label>");
         if (type && strcmp(type, "textarea") == 0) {
-            sb_puts(&r->body, "<textarea name=\"");
+            sb_puts(&r->body, "<textarea class=\"form-control\" name=\"");
             put_esc(&r->body, name ? name : ""); sb_puts(&r->body, "\">");
-            put_esc(&r->body, value); sb_puts(&r->body, "</textarea>\n");
+            put_esc(&r->body, value); sb_puts(&r->body, "</textarea>");
         } else {
-            sb_puts(&r->body, "<input type=\"");
+            sb_puts(&r->body, "<input class=\"form-control\" type=\"");
             put_esc(&r->body, type ? type : "text");
             sb_puts(&r->body, "\" name=\"");
             put_esc(&r->body, name ? name : "");
             sb_puts(&r->body, "\" value=\"");
             put_esc(&r->body, value);
-            sb_puts(&r->body, "\">\n");
+            sb_puts(&r->body, "\">");
         }
+        sb_puts(&r->body, "</div>\n");
 
     } else if (strcmp(c, "text") == 0) {
         const char *contents = row_get(row, "contents");
         sb_puts(&r->body, "<p>"); put_esc(&r->body, contents); sb_puts(&r->body, "</p>\n");
+
+    } else if (strcmp(c, "chart") == 0) {
+        /* accumulate one (x, y) point as JSON for ApexCharts */
+        if (r->comp_rows > 0) { sb_putc(&r->chart_x, ','); sb_putc(&r->chart_y, ','); }
+        json_value(&r->chart_x, row_get(row, "x"));
+        json_value(&r->chart_y, row_get(row, "y"));
+
+    } else if (strcmp(c, "map") == 0) {
+        /* accumulate one marker [lat, lon, popup] as JSON for Leaflet */
+        const char *popup = row_get(row, "title");
+        if (!popup) popup = row_get(row, "description");
+        if (r->comp_rows > 0) sb_putc(&r->map_markers, ',');
+        sb_putc(&r->map_markers, '[');
+        json_value(&r->map_markers, row_get(row, "latitude"));
+        sb_putc(&r->map_markers, ',');
+        json_value(&r->map_markers, row_get(row, "longitude"));
+        sb_putc(&r->map_markers, ',');
+        json_value(&r->map_markers, popup);     /* number or quoted string or null */
+        sb_putc(&r->map_markers, ']');
     }
 }
 
 static void component_close(render_t *r) {
     if (!r->current) return;
     if (strcmp(r->current, "table") == 0) {
-        if (r->comp_rows > 0) sb_puts(&r->body, "</tbody>\n</table>\n");
+        if (r->comp_rows > 0) sb_puts(&r->body, "</tbody>\n</table></div>\n"); /* tbody, table, responsive */
+        sb_puts(&r->body, "</div>\n");                                          /* card */
+        if (r->table_id && r->comp_rows > 0)                                    /* make it a spreadsheet */
+            sb_printf(&r->body,
+                "<script>new simpleDatatables.DataTable("
+                "document.getElementById('table%d'),"
+                "{searchable:%s,sortable:%s,paging:true,perPage:%d});</script>\n",
+                r->table_id, r->table_search ? "true" : "false",
+                r->table_sort ? "true" : "false", r->table_per_page);
     } else if (strcmp(r->current, "list") == 0) {
-        sb_puts(&r->body, "</ul>\n");
+        sb_puts(&r->body, "</div></div>\n");                                    /* list-group, card */
     } else if (strcmp(r->current, "card") == 0) {
-        sb_puts(&r->body, "</div>\n");
+        sb_puts(&r->body, "</div>\n");                                          /* row row-cards */
     } else if (strcmp(r->current, "form") == 0) {
-        sb_puts(&r->body, "<button type=\"submit\">Submit</button>\n</form>\n");
+        sb_puts(&r->body, "<button class=\"btn btn-primary\" type=\"submit\">Submit</button>\n"
+                          "</div>\n</form>\n");                                  /* button, card-body, form */
+    } else if (strcmp(r->current, "chart") == 0) {
+        const char *t   = r->chart_type ? r->chart_type : "line";
+        int         pie = (strcmp(t, "pie") == 0 || strcmp(t, "donut") == 0);
+        sb_printf(&r->body, "<script>new ApexCharts(document.getElementById('chart%d'),{",
+                  r->chart_seq);
+        sb_printf(&r->body, "chart:{type:'%s',height:320}", t);
+        if (pie) {
+            sb_puts(&r->body, ",series:["); sb_write(&r->body, r->chart_y.data, r->chart_y.len);
+            sb_puts(&r->body, "],labels:["); sb_write(&r->body, r->chart_x.data, r->chart_x.len);
+            sb_puts(&r->body, "]");
+        } else {
+            sb_puts(&r->body, ",series:[{name:'value',data:[");
+            sb_write(&r->body, r->chart_y.data, r->chart_y.len);
+            sb_puts(&r->body, "]}],xaxis:{categories:[");
+            sb_write(&r->body, r->chart_x.data, r->chart_x.len);
+            sb_puts(&r->body, "]}");
+        }
+        sb_puts(&r->body, "}).render();</script>\n");
+        sb_puts(&r->body, "</div>\n");   /* close the chart's card */
+
+    } else if (strcmp(r->current, "map") == 0) {
+        sb_printf(&r->body,
+            "<script>(function(){var m=L.map('map%d');"
+            "L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',"
+            "{maxZoom:19,attribution:'&copy; OpenStreetMap'}).addTo(m);var pts=[",
+            r->map_id);
+        sb_write(&r->body, r->map_markers.data, r->map_markers.len);
+        sb_puts(&r->body,
+            "];var g=L.featureGroup();pts.forEach(function(p){var k=L.marker([p[0],p[1]]);"
+            "if(p[2]!=null)k.bindPopup(String(p[2]));k.addTo(g);});g.addTo(m);");
+        if (r->map_lat && r->map_lon && is_number(r->map_lat) && is_number(r->map_lon)) {
+            const char *z = (r->map_zoom && is_number(r->map_zoom)) ? r->map_zoom : "13";
+            sb_printf(&r->body, "m.setView([%s,%s],%s);", r->map_lat, r->map_lon, z);
+        } else {
+            sb_puts(&r->body,
+                "if(pts.length)m.fitBounds(g.getBounds().pad(0.2));else m.setView([0,0],2);");
+        }
+        sb_puts(&r->body, "})();</script>\n</div>\n");   /* close IIFE + card */
     }
 }
 
@@ -316,9 +508,17 @@ static void emit_headers(render_t *r, sb_t *out) {
 static void render_done(render_t *r) {
     sb_free(&r->body);
     sb_free(&r->headers);
+    sb_free(&r->chart_x);
+    sb_free(&r->chart_y);
+    sb_free(&r->map_markers);
     free(r->redirect);
     free(r->title);
     free(r->current);
+    free(r->assets_base);
+    free(r->chart_type);
+    free(r->map_lat);
+    free(r->map_lon);
+    free(r->map_zoom);
     free(r);
 }
 
@@ -326,6 +526,8 @@ void render_finish(render_t *r, io_t *io) {
     sb_t out;
     flush_head(r);          /* ensure a head even for empty output */
     component_close(r);
+    if (r->shell_enabled && !r->redirect)
+        sb_puts(&r->body, "</div></div></div></div>\n");  /* container/page-body/wrapper/page */
     if (r->debug && !r->redirect)
         append_debug_bar(r);
     if (r->shell_enabled && !r->redirect)

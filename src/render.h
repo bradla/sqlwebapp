@@ -8,7 +8,8 @@
 
 typedef struct render_state render_t;
 
-render_t *render_new(void);
+/* `assets_base` is the URL prefix for Tabler/ApexCharts (e.g. "/assets"). */
+render_t *render_new(const char *assets_base);
 
 /* Row sink: pass this (with the render_t as `user`) to db_run_script. */
 void      render_row(const row_t *row, void *user);

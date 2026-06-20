@@ -117,6 +117,20 @@ int cgi_read(cgi_request_t *r, io_t *io) {
     parse_urlencoded(&r->params, io->env(io, "QUERY_STRING"));
     parse_cookies(&r->cookies, io->env(io, "HTTP_COOKIE"));
 
+    /* Expose each cookie to SQL as a $cookie_<name> parameter, so the same
+       binding path serves it on both backends (SQLite and PostgreSQL). */
+    {
+        size_t i;
+        for (i = 0; i < r->cookies.len; i++) {
+            const char *cname = r->cookies.items[i].key;
+            char       *pkey  = xmalloc(strlen("cookie_") + strlen(cname) + 1);
+            strcpy(pkey, "cookie_");
+            strcat(pkey, cname);
+            map_add(&r->params, pkey, r->cookies.items[i].val);
+            free(pkey);
+        }
+    }
+
     /* Read request body (POST/PUT) up to CONTENT_LENGTH. */
     clen_s = io->env(io, "CONTENT_LENGTH");
     if (clen_s) {
