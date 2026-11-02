@@ -28,7 +28,7 @@ void map_add(map_t *m, const char *key, const char *val) {
         m->items = xrealloc(m->items, m->cap * sizeof(*m->items));
     }
     m->items[m->len].key = xstrdup(key);
-    m->items[m->len].val = xstrdup(val ? val : "");
+    m->items[m->len].val = val ? xstrdup(val) : NULL;   /* NULL = SQL NULL */
     m->len++;
 }
 

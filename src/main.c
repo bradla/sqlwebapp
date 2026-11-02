@@ -1,23 +1,30 @@
 #define _POSIX_C_SOURCE 200809L  /* clock_gettime / CLOCK_MONOTONIC */
 #define _DEFAULT_SOURCE 1        /* getrusage */
-/* main.c - csqlpage entry point: plain CGI or FastCGI (C99)
+/* main.c - csqlpage entry point: plain CGI, FastCGI or HTTP (C99)
  *
  * Environment (CGI vars + these):
  *   SQLPAGE_WEB_ROOT       directory holding .sql files     (default ".")
  *   SQLPAGE_DATABASE_URL   sqlite://... | postgres://...    (default sqlite)
  *   SQLPAGE_FCGI_BIND      optional "ip:port" or "/sock" to run as FastCGI
+ *   SQLPAGE_HTTP_LISTEN    optional "host:port" to run the built-in HTTP server
+ *   SQLPAGE_API_PREFIX     paths under it get JSON errors (e.g. "/api/")
+ *   SQLPAGE_JWT_SECRET     HS256 key for the sqlpage.user_id()/jwt() functions
  *
- * Transport is chosen automatically: if launched as a FastCGI app (stdin is a
- * listening socket) or SQLPAGE_FCGI_BIND is set, it serves a FastCGI loop;
- * otherwise it handles a single CGI request and exits.
+ * Transport is chosen automatically: SQLPAGE_HTTP_LISTEN selects the HTTP
+ * server; if launched as a FastCGI app (stdin is a listening socket) or
+ * SQLPAGE_FCGI_BIND is set, it serves a FastCGI loop; otherwise it handles a
+ * single CGI request and exits.
  *
- * Routing: PATH_INFO -> <web_root>/<path>; "" or "/" maps to "index.sql".
+ * Routing: PATH_INFO -> a .sql file under the web root (see route.h);
+ * "" or "/" maps to "index.sql".
  */
 #include "cgi.h"
 #include "db.h"
 #include "fastcgi.h"
+#include "http.h"
 #include "io.h"
 #include "render.h"
+#include "route.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -50,34 +57,34 @@ static long peak_rss_kb(void) {
     return -1;
 }
 
-/* Reject paths that could escape the web root. */
-static int path_is_safe(const char *p) {
-    if (strstr(p, "..")) return 0;
-    for (; *p; p++) if (*p == '\\') return 0;
-    return 1;
-}
+/* Routes scanned once at startup by the HTTP server (scripts cached too);
+   NULL under CGI/FastCGI, where each request rescans so edits show at once. */
+static route_tree_t *g_routes = NULL;
 
 /* Read an entire file into a NUL-terminated buffer (caller frees). */
 static char *read_file(const char *path) {
     FILE  *f = fopen(path, "rb");
     sb_t   sb;
-    int    ch;
+    char   buf[4096];
+    size_t n;
     if (!f) return NULL;
     sb_init(&sb);
-    while ((ch = fgetc(f)) != EOF) sb_putc(&sb, (char)ch);
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) sb_write(&sb, buf, n);
     fclose(f);
     return sb.data;   /* ownership transferred; NUL-terminated by sb */
 }
 
 /* Handle one request on the given transport. */
 static void handle_request(io_t *io) {
-    cgi_request_t req;
-    render_t     *r;
-    const char   *web_root, *rel, *dburl;
-    char         *fullpath, *sql, *errmsg = NULL;
-    double        t_start = now_sec();
-    double        db_ms   = 0;
-    int           dbg;
+    cgi_request_t       req;
+    render_t           *r;
+    route_tree_t       *routes = g_routes;
+    const route_file_t *file;
+    const char         *rel, *dburl, *api;
+    char               *sql = NULL;
+    double              t_start = now_sec();
+    double              db_ms   = 0;
+    int                 dbg;
 
     cgi_read(&req, io);
     dbg = debug_enabled(io);
@@ -95,54 +102,47 @@ static void handle_request(io_t *io) {
             (rel[plen] == '/' || rel[plen] == '\0'))
             rel += plen;
     }
-    while (*rel == '/') rel++;              /* drop leading slashes */
-    if (*rel == '\0') rel = "index.sql";
 
-    if (!path_is_safe(rel)) {
-        if (dbg) render_set_debug(r, (now_sec() - t_start) * 1000, db_ms, peak_rss_kb());
-        render_error(r, io, "Forbidden: invalid path");
-        cgi_free(&req);
-        return;
-    }
+    api = io->env(io, "SQLPAGE_API_PREFIX");
+    if (api && *api && strncmp(rel, api, strlen(api)) == 0) render_set_json_errors(r);
 
-    web_root = io_env_or(io, "SQLPAGE_WEB_ROOT", ".");
-    {
-        size_t n = strlen(web_root) + 1 + strlen(rel) + 1;
-        fullpath = xmalloc(n);
-        snprintf(fullpath, n, "%s/%s", web_root, rel);
-    }
-
-    sql = read_file(fullpath);
+    /* Only files found by scanning the web root can match, so a path can't
+       escape it. */
+    if (!routes) routes = route_load(io_env_or(io, "SQLPAGE_WEB_ROOT", "."), 0);
+    file = route_find(routes, req.method, rel, &req.params);
+    if (file) sql = file->sql ? file->sql : read_file(file->path);
     if (!sql) {
-        sb_t msg; sb_init(&msg);
-        sb_printf(&msg, "Not found: %s", fullpath);
         if (dbg) render_set_debug(r, (now_sec() - t_start) * 1000, db_ms, peak_rss_kb());
-        render_error(r, io, msg.data);
-        sb_free(&msg);
-        free(fullpath);
-        cgi_free(&req);
-        return;
+        render_error(r, io, 404, "Not found");
+        goto done;
     }
 
     dburl = io_env_or(io, "SQLPAGE_DATABASE_URL", "sqlite://./sqlpage.db");
     {
-        double db_start = now_sec();
-        int    rc = db_run_script(dburl, sql, &req, render_row, r, &errmsg);
+        double     db_start = now_sec();
+        db_error_t err;
+        int        rc = db_run_script(dburl, sql, &req, render_row, r, &err);
         db_ms = (now_sec() - db_start) * 1000;
         if (dbg) render_set_debug(r, (now_sec() - t_start) * 1000, db_ms, peak_rss_kb());
         if (rc != 0) {
             sb_t msg; sb_init(&msg);
-            sb_printf(&msg, "Database error: %s", errmsg ? errmsg : "(unknown)");
-            render_error(r, io, msg.data);
+            if (err.status == 500) {
+                sb_printf(&msg, "Database error: %s", err.message ? err.message : "(unknown)");
+                fprintf(stderr, "%s %s: %s\n", req.method, rel, msg.data);
+            } else {
+                sb_puts(&msg, err.message ? err.message : "request rejected");
+            }
+            render_error(r, io, err.status, msg.data);
             sb_free(&msg);
-            free(errmsg);
+            free(err.message);
         } else {
             render_finish(r, io);
         }
     }
 
-    free(sql);
-    free(fullpath);
+done:
+    if (file && !file->sql) free(sql);
+    if (routes != g_routes) route_free(routes);
     cgi_free(&req);
 }
 
@@ -159,6 +159,11 @@ static void cgi_io_write(io_t *self, const char *buf, size_t n) {
 }
 
 int main(void) {
+    if (http_should_serve()) {
+        const char *root = getenv("SQLPAGE_WEB_ROOT");
+        g_routes = route_load(root ? root : ".", 1);
+        return http_serve(handle_request);
+    }
     if (fcgi_should_serve())
         return fcgi_serve(handle_request);
 

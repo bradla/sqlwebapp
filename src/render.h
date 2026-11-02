@@ -11,15 +11,21 @@ typedef struct render_state render_t;
 /* `assets_base` is the URL prefix for Tabler/ApexCharts (e.g. "/assets"). */
 render_t *render_new(const char *assets_base);
 
-/* Row sink: pass this (with the render_t as `user`) to db_run_script. */
-void      render_row(const row_t *row, void *user);
+/* Row sink: pass this (with the render_t as `user`) to db_run_script.
+   Returns non-zero once the response is complete (the `json` component). */
+int       render_row(const row_t *row, void *user);
 
 /* Write the complete response (status line, headers, body) to `io` and free
    the renderer. Safe to call even if no rows were produced. */
 void      render_finish(render_t *r, io_t *io);
 
-/* Write a complete error page (500) to `io` and free. */
-void      render_error(render_t *r, io_t *io, const char *message);
+/* Write a complete error response with the given HTTP status to `io` and
+   free: an HTML page, or {"errors":{"body":[message]}} after
+   render_set_json_errors. */
+void      render_error(render_t *r, io_t *io, int status, const char *message);
+
+/* Report errors as JSON (for API routes). */
+void      render_set_json_errors(render_t *r);
 
 /* Enable a debug footer reporting timing and peak memory. Call before
    render_finish / render_error. */

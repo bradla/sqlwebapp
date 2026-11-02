@@ -113,6 +113,10 @@ int cgi_read(cgi_request_t *r, io_t *io) {
     map_init(&r->params);
     map_init(&r->cookies);
     sb_init(&r->body);
+    r->authorization = io->env(io, "HTTP_AUTHORIZATION");
+    r->jwt_secret    = io->env(io, "SQLPAGE_JWT_SECRET");
+    r->auth_checked  = 0;
+    r->user_id       = NULL;
 
     parse_urlencoded(&r->params, io->env(io, "QUERY_STRING"));
     parse_cookies(&r->cookies, io->env(io, "HTTP_COOKIE"));
@@ -160,4 +164,5 @@ void cgi_free(cgi_request_t *r) {
     map_free(&r->params);
     map_free(&r->cookies);
     sb_free(&r->body);
+    free(r->user_id);
 }

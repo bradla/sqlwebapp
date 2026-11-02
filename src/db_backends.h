@@ -4,14 +4,14 @@
 #ifndef CSQLPAGE_DB_BACKENDS_H
 #define CSQLPAGE_DB_BACKENDS_H
 
-#include "db.h"   /* row_cb, cgi_request_t */
+#include "db.h"   /* row_cb, db_error_t, cgi_request_t */
 
 int sqlite_run_script(const char *path, const char *sql,
-                      const cgi_request_t *req, row_cb cb, void *user,
-                      char **errmsg);
+                      cgi_request_t *req, row_cb cb, void *user,
+                      db_error_t *err);
 
 int pg_run_script(const char *conninfo, const char *sql,
-                  const cgi_request_t *req, row_cb cb, void *user,
-                  char **errmsg);
+                  cgi_request_t *req, row_cb cb, void *user,
+                  db_error_t *err);
 
 #endif

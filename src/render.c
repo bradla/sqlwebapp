@@ -8,6 +8,9 @@
  *   - "Header" components (status_code, http_header, redirect, shell) are
  *     only honoured before any body output; they shape the response head.
  *   - The page is wrapped in a default `shell` unless `shell-empty` is used.
+ *   - The `json` component answers with its `contents` verbatim as
+ *     application/json (status from its `status` prop) and ends the script,
+ *     so an API endpoint is a list of guards followed by the happy path.
  */
 #include "render.h"
 #include "map.h"
@@ -27,6 +30,8 @@ struct render_state {
 
     int    head_flushed;    /* have we committed to the body phase?        */
     char  *current;         /* active body component name (owned), or NULL */
+    int    json;            /* answering with a raw JSON body?             */
+    int    json_errors;     /* report errors as JSON instead of HTML?      */
     long   comp_rows;       /* data rows emitted into current component     */
 
     int    debug;           /* append a debug footer?                      */
@@ -124,6 +129,8 @@ render_t *render_new(const char *assets_base) {
     r->title         = NULL;
     r->head_flushed  = 0;
     r->current       = NULL;
+    r->json          = 0;
+    r->json_errors   = 0;
     r->comp_rows     = 0;
     r->debug         = 0;
     r->total_ms      = 0;
@@ -208,9 +215,20 @@ static void flush_head(render_t *r) {
 
 /* ---- public row sink --------------------------------------------------- */
 
-void render_row(const row_t *row, void *user) {
+int render_row(const row_t *row, void *user) {
     render_t   *r    = user;
     const char *comp = row_get(row, "component");
+
+    if (comp && strcmp(comp, "json") == 0) {
+        /* The whole response: replaces anything rendered so far. */
+        const char *st       = row_get(row, "status");
+        const char *contents = row_get(row, "contents");
+        r->json = 1;
+        if (st) r->status = atoi(st);
+        sb_clear(&r->body);
+        sb_puts(&r->body, contents);
+        return 1;
+    }
 
     if (comp && *comp) {
         /* Header components are only valid before body output begins. */
@@ -240,7 +258,7 @@ void render_row(const row_t *row, void *user) {
             } else { /* shell-empty */
                 r->shell_enabled = 0;
             }
-            return;
+            return 0;
         }
 
         /* A body component: start the body phase, then switch component. */
@@ -250,7 +268,7 @@ void render_row(const row_t *row, void *user) {
         r->current   = xstrdup(comp);
         r->comp_rows = 0;
         component_open(r, row);
-        return;
+        return 0;
     }
 
     /* No component column: data row for the active component. */
@@ -262,6 +280,7 @@ void render_row(const row_t *row, void *user) {
     }
     component_data_row(r, row);
     r->comp_rows++;
+    return 0;
 }
 
 /* ---- the components ---------------------------------------------------- */
@@ -522,8 +541,27 @@ static void render_done(render_t *r) {
     free(r);
 }
 
+void render_set_json_errors(render_t *r) { r->json_errors = 1; }
+
+/* A JSON response: status, headers and the body exactly as the SQL built it
+   (a 204 or an empty body carries no Content-Type). */
+static void finish_json(render_t *r, io_t *io) {
+    sb_t out;
+    sb_init(&out);
+    sb_printf(&out, "Status: %d\r\n", r->status);
+    if (r->headers.len) sb_write(&out, r->headers.data, r->headers.len);
+    if (r->status != 204 && r->body.len)
+        sb_puts(&out, "Content-Type: application/json\r\n");
+    sb_puts(&out, "\r\n");
+    if (r->status != 204) sb_write(&out, r->body.data, r->body.len);
+    io->write(io, out.data, out.len);
+    sb_free(&out);
+    render_done(r);
+}
+
 void render_finish(render_t *r, io_t *io) {
     sb_t out;
+    if (r->json) { finish_json(r, io); return; }
     flush_head(r);          /* ensure a head even for empty output */
     component_close(r);
     if (r->shell_enabled && !r->redirect)
@@ -542,12 +580,22 @@ void render_finish(render_t *r, io_t *io) {
     render_done(r);
 }
 
-void render_error(render_t *r, io_t *io, const char *message) {
+void render_error(render_t *r, io_t *io, int status, const char *message) {
     /* Nothing has been written to the transport yet (output is buffered),
-       so always emit a clean 500 with proper CGI headers. */
+       so always emit a clean error with proper CGI headers. */
     sb_t out;
     sb_init(&out);
-    sb_puts(&out, "Status: 500\r\nContent-Type: text/html; charset=utf-8\r\n\r\n");
+    if (r->json_errors) {   /* {"errors": {"body": ["<message>"]}} */
+        sb_printf(&out, "Status: %d\r\nContent-Type: application/json\r\n\r\n", status);
+        sb_puts(&out, "{\"errors\":{\"body\":[");
+        json_quote(&out, message);
+        sb_puts(&out, "]}}");
+        io->write(io, out.data, out.len);
+        sb_free(&out);
+        render_done(r);
+        return;
+    }
+    sb_printf(&out, "Status: %d\r\nContent-Type: text/html; charset=utf-8\r\n\r\n", status);
     sb_puts(&out, "<!DOCTYPE html><html><head><title>Error</title></head><body>\n");
     sb_puts(&out, "<pre style=\"color:#b00;white-space:pre-wrap\">");
     sb_put_html(&out, message);

@@ -12,6 +12,12 @@ typedef struct {
     map_t       params;      /* merged query-string + form-body params    */
     map_t       cookies;     /* parsed from HTTP_COOKIE                    */
     sb_t        body;        /* raw request body bytes                    */
+
+    /* Token authentication, consumed by the sqlpage.user_id() family. */
+    const char *authorization; /* HTTP_AUTHORIZATION, or NULL             */
+    const char *jwt_secret;    /* SQLPAGE_JWT_SECRET, or NULL             */
+    int         auth_checked;  /* has the header been verified yet?       */
+    char       *user_id;       /* verified token subject (owned), or NULL */
 } cgi_request_t;
 
 /* Populate `r` from the request transport `io`. Returns 0 on success.

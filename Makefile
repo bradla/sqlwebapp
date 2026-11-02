@@ -1,10 +1,10 @@
-# csqlpage - portable C99 CGI build
+# csqlpage - C99 build: CGI, FastCGI, and the built-in HTTP server (Linux)
 #
 #   make            SQLite only (default)
 #   make PG=1       also build the PostgreSQL backend (needs libpq / pkg-config)
 CC      ?= cc
-CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pedantic
-LDLIBS  ?= -lsqlite3
+CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pedantic -pthread
+LDLIBS  ?= -lsqlite3 -lcrypt -pthread
 
 # Optional PostgreSQL backend (db_pg.c is empty unless WITH_PG is defined).
 ifdef PG

@@ -21,11 +21,12 @@ static void bind_named_params(sqlite3_stmt *stmt, const cgi_request_t *req) {
     }
 }
 
-/* Build a row_t from the current step of a SELECT statement, invoke cb. */
-static void emit_row(sqlite3_stmt *stmt, row_cb cb, void *user) {
+/* Build a row_t from the current step of a SELECT statement, invoke cb.
+   Returns the callback's result (non-zero = stop the script). */
+static int emit_row(sqlite3_stmt *stmt, row_cb cb, void *user) {
     int    ncol = sqlite3_column_count(stmt);
     row_t  row;
-    int    c;
+    int    c, stop;
 
     row.len   = (size_t)ncol;
     row.cells = xmalloc((size_t)ncol * sizeof(cell_t));
@@ -40,29 +41,29 @@ static void emit_row(sqlite3_stmt *stmt, row_cb cb, void *user) {
         }
     }
 
-    cb(&row, user);
+    stop = cb(&row, user);
 
     for (c = 0; c < ncol; c++) {
         free(row.cells[c].name);
         free(row.cells[c].value);
     }
     free(row.cells);
+    return stop;
 }
 
 int sqlite_run_script(const char        *path,
                       const char        *sql,
-                      const cgi_request_t *req,
+                      cgi_request_t     *req,
                       row_cb             cb,
                       void              *user,
-                      char             **errmsg) {
+                      db_error_t        *err) {
     sqlite3     *db   = NULL;
     const char  *tail = sql;
     int          rc;
 
-    *errmsg = NULL;
     rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
-        *errmsg = xstrdup(sqlite3_errmsg(db));
+        err->message = xstrdup(sqlite3_errmsg(db));
         sqlite3_close(db);
         return 1;
     }
@@ -74,7 +75,7 @@ int sqlite_run_script(const char        *path,
 
         rc = sqlite3_prepare_v2(db, tail, -1, &stmt, &next);
         if (rc != SQLITE_OK) {
-            *errmsg = xstrdup(sqlite3_errmsg(db));
+            err->message = xstrdup(sqlite3_errmsg(db));
             sqlite3_close(db);
             return 1;
         }
@@ -85,11 +86,15 @@ int sqlite_run_script(const char        *path,
         for (;;) {
             rc = sqlite3_step(stmt);
             if (rc == SQLITE_ROW) {
-                emit_row(stmt, cb, user);
+                if (emit_row(stmt, cb, user)) {   /* response complete */
+                    sqlite3_finalize(stmt);
+                    sqlite3_close(db);
+                    return 0;
+                }
             } else if (rc == SQLITE_DONE) {
                 break;
             } else {
-                *errmsg = xstrdup(sqlite3_errmsg(db));
+                err->message = xstrdup(sqlite3_errmsg(db));
                 sqlite3_finalize(stmt);
                 sqlite3_close(db);
                 return 1;

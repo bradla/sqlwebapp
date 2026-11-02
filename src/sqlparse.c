@@ -6,6 +6,7 @@
  * on ';' and rewrite $name / :name into $1..$N.
  */
 #include "sqlparse.h"
+#include "sqlfn.h"
 #include "util.h"
 
 #include <stdlib.h>
@@ -16,6 +17,15 @@ static int is_ident_start(int c) {
 }
 static int is_ident(int c) {
     return is_ident_start(c) || (c >= '0' && c <= '9');
+}
+
+static int strncasecmp_ascii(const char *a, const char *b, size_t n) {
+    for (; n > 0; n--, a++, b++) {
+        int x = (*a >= 'a' && *a <= 'z') ? *a - 32 : *a;
+        int y = (*b >= 'a' && *b <= 'z') ? *b - 32 : *b;
+        if (x != y || !x) return x - y;
+    }
+    return 0;
 }
 
 /* in-progress statement being assembled */
@@ -58,8 +68,88 @@ static int only_whitespace(const char *s) {
     return 1;
 }
 
+/* Skip whitespace and comments. */
+static const char *skip_space(const char *p) {
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (p[0] == '-' && p[1] == '-') {
+            while (*p && *p != '\n') p++;
+        } else if (p[0] == '/' && p[1] == '*') {
+            const char *e = strstr(p + 2, "*/");
+            p = e ? e + 2 : p + strlen(p);
+        } else {
+            return p;
+        }
+    }
+}
+
+/* Read an identifier at *p into a fresh string, advancing *p. */
+static char *take_ident(const char **p) {
+    const char *s = *p;
+    char       *id;
+    if (!is_ident_start((unsigned char)*s)) return NULL;
+    while (is_ident((unsigned char)**p)) (*p)++;
+    id = xmalloc((size_t)(*p - s) + 1);
+    memcpy(id, s, (size_t)(*p - s));
+    id[*p - s] = '\0';
+    return id;
+}
+
+/* Recognise "SET x = expr" / "SET (x, y) = (query)" and rewrite st into the
+   query that produces the value(s). Anything else (SET LOCAL ..., SET x TO
+   ...) is left alone and goes to the database as written. */
+static void parse_set(pg_stmt_t *st) {
+    const char *p = skip_space(st->sql);
+    char      **names = NULL;
+    int         nnames = 0, multi = 0;
+    sb_t        q;
+
+    if (strncasecmp_ascii(p, "SET", 3) != 0 || is_ident((unsigned char)p[3])) return;
+    p = skip_space(p + 3);
+    if (*p == '(') { multi = 1; p = skip_space(p + 1); }
+    for (;;) {
+        char *id = take_ident(&p);
+        if (!id) goto no;
+        names = xrealloc(names, (size_t)(nnames + 1) * sizeof(char *));
+        names[nnames++] = id;
+        p = skip_space(p);
+        if (!multi) break;
+        if (*p == ',') { p = skip_space(p + 1); continue; }
+        if (*p == ')') { p = skip_space(p + 1); break; }
+        goto no;
+    }
+    if (*p != '=') goto no;
+    p = skip_space(p + 1);
+
+    st->set_names = names;
+    st->nset      = nnames;
+    if (!multi && p[0] == '$' && p[1] >= '1' && p[1] <= '9') {   /* lone $N? */
+        const char *e = p + 1;
+        while (*e >= '0' && *e <= '9') e++;
+        if (*skip_space(e) == '\0') st->set_param = atoi(p + 1);
+    }
+    sb_init(&q);
+    if (multi) {            /* (query) runs as written, so it may be DML ... RETURNING */
+        const char *e = p + strlen(p);
+        while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r')) e--;
+        if (*p != '(' || e[-1] != ')') { sb_free(&q); st->set_names = NULL; st->nset = 0; goto no; }
+        sb_write(&q, p + 1, (size_t)(e - p - 2));
+    } else {
+        sb_puts(&q, "SELECT ");
+        sb_puts(&q, p);
+    }
+    free(st->sql);
+    st->sql = q.data;
+    return;
+no:
+    while (nnames > 0) free(names[--nnames]);
+    free(names);
+}
+
 /* Finalize the current statement into the output array (skipping blanks). */
 static void flush(build_t *b, pg_stmt_t **out, size_t *n, size_t *cap) {
+    static int next_id = 0;
+    pg_stmt_t *st;
     if (only_whitespace(b->sql.data)) {
         sb_free(&b->sql);
         free(b->names);
@@ -70,9 +160,15 @@ static void flush(build_t *b, pg_stmt_t **out, size_t *n, size_t *cap) {
         *cap = *cap ? *cap * 2 : 8;
         *out = xrealloc(*out, *cap * sizeof(pg_stmt_t));
     }
-    (*out)[*n].sql     = xstrdup(b->sql.data);
-    (*out)[*n].names   = b->names;
-    (*out)[*n].nparams = b->nparams;
+    st = &(*out)[*n];
+    st->sql       = xstrdup(b->sql.data);
+    st->names     = b->names;
+    st->nparams   = b->nparams;
+    st->set_names = NULL;
+    st->nset      = 0;
+    st->set_param = 0;
+    st->id        = __sync_add_and_fetch(&next_id, 1);
+    parse_set(st);
     (*n)++;
     sb_free(&b->sql);
     build_reset(b);
@@ -172,6 +268,16 @@ pg_stmt_t *sqlparse_split(const char *s, size_t *count) {
         }
         if (c == ';') { flush(&b, &out, &n, &cap); s++; continue; }
 
+        if (c == 's' && (b.sql.len == 0 || !is_ident((unsigned char)b.sql.data[b.sql.len - 1])) &&
+            sqlfn_is_call(s)) {                        /* sqlpage.fn(...) */
+            size_t len = sqlfn_call_len(s);
+            if (len) {
+                sb_printf(&b.sql, "$%d", param_index(&b, s, len));
+                s += len;
+                continue;
+            }
+        }
+
         sb_putc(&b.sql, *s++);
     }
     flush(&b, &out, &n, &cap);
@@ -187,6 +293,8 @@ void sqlparse_free(pg_stmt_t *stmts, size_t count) {
         free(stmts[i].sql);
         for (j = 0; j < stmts[i].nparams; j++) free(stmts[i].names[j]);
         free(stmts[i].names);
+        for (j = 0; j < stmts[i].nset; j++) free(stmts[i].set_names[j]);
+        free(stmts[i].set_names);
     }
     free(stmts);
 }

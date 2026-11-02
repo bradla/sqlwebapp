@@ -17,9 +17,10 @@ typedef struct {
 
 void        map_init(map_t *m);
 void        map_free(map_t *m);
-/* Takes ownership of nothing; copies key and val. */
+/* Takes ownership of nothing; copies key and val. val may be NULL (SQL NULL),
+   which shadows any earlier value for the key. */
 void        map_add(map_t *m, const char *key, const char *val);
-/* Returns last value for key, or NULL. Case-sensitive. */
+/* Returns last value for key, or NULL (absent or NULL). Case-sensitive. */
 const char *map_get(const map_t *m, const char *key);
 
 #endif
